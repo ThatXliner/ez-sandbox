@@ -1,0 +1,20 @@
+{
+  "name": "ez-sandbox",
+  "version": "0.1.0",
+  "description": "One command to sandbox Claude Code's Bash tool (Seatbelt on macOS, bubblewrap on Linux).",
+  "module": "index.ts",
+  "type": "module",
+  "bin": {
+    "ez-sandbox": "index.ts"
+  },
+  "scripts": {
+    "start": "bun run index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}

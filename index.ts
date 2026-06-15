@@ -22,13 +22,27 @@ import { join } from "node:path";
 
 type NetworkMode = "default" | "lockdown";
 
+// How aggressively to reduce permission prompts (sets permissions.defaultMode).
+//   none        → leave defaultMode alone; sandbox still auto-allows Bash, but
+//                 file edits/writes prompt as usual.
+//   acceptEdits → auto-accept edits/writes in the working dir. Near prompt-free
+//                 with the sandbox. No version/model requirements.
+//   auto        → Anthropic's classifier-gated mode — the official safe stand-in
+//                 for --dangerously-skip-permissions. Needs a recent Claude Code
+//                 (≥ v2.1.83) and Opus 4.6+/Sonnet 4.6.
+// `undefined` means "not specified on the CLI" → ask interactively (or fall back
+// to "none" when running non-interactively / with -y).
+type PromptsMode = "none" | "acceptEdits" | "auto";
+
 interface Options {
   dryRun: boolean;
   check: boolean;
   print: boolean;
   strict: boolean; // failIfUnavailable: refuse to start unsandboxed
   network: NetworkMode;
+  prompts: PromptsMode | undefined;
   yes: boolean; // skip the Linux dependency-install prompt
+  uninstall: boolean; // remove what ez-sandbox added
   help: boolean;
 }
 
@@ -39,7 +53,9 @@ function parseArgs(argv: string[]): Options {
     print: false,
     strict: false,
     network: "default",
+    prompts: undefined,
     yes: false,
+    uninstall: false,
     help: false,
   };
   for (const arg of argv) {
@@ -64,11 +80,25 @@ function parseArgs(argv: string[]): Options {
       case "--yes":
         opts.yes = true;
         break;
+      case "--uninstall":
+        opts.uninstall = true;
+        break;
       case "--network=default":
         opts.network = "default";
         break;
       case "--network=lockdown":
         opts.network = "lockdown";
+        break;
+      case "--auto":
+      case "--prompts=auto":
+        opts.prompts = "auto";
+        break;
+      case "--accept-edits":
+      case "--prompts=accept-edits":
+        opts.prompts = "acceptEdits";
+        break;
+      case "--prompts=none":
+        opts.prompts = "none";
         break;
       default:
         fail(`Unknown argument: ${arg}\nRun \`ez-sandbox --help\` for usage.`);
@@ -87,16 +117,30 @@ What it does:
   • macOS: nothing to install (uses the built-in Seatbelt framework)
   • Linux/WSL2: installs bubblewrap + socat (needs sudo) if missing
   • Denies sandboxed Bash from reading secrets (~/.ssh, ~/.aws, ~/.gnupg, ...)
+  • Optionally reduces permission prompts safely (sandbox replaces the Bash
+    prompt; choose how file edits are handled — see --prompts below)
   • Merges into ~/.claude/settings.json without touching your other settings
 
 Options:
   --check            Report current sandbox status and exit (no changes)
-  --print            Print the sandbox config that would be written, then exit
+  --print            Print the config that would be written, then exit
   --dry-run          Show what would change without writing or installing
   --network=default  Keep Claude Code's prompt-on-new-domain behavior (default)
   --network=lockdown Block egress except Anthropic + common package registries
+
+  Fewer prompts (the safe alternative to --dangerously-skip-permissions):
+  --auto             Use Claude Code's classifier-gated 'auto' mode — its
+                     official safe stand-in for --dangerously-skip-permissions.
+                     Needs Claude Code ≥ v2.1.83 and Opus 4.6+/Sonnet 4.6.
+  --accept-edits     Auto-accept file edits/writes in the working dir. Works
+                     everywhere; combined with the sandbox it's near prompt-free.
+  --prompts=none     Don't touch permission mode (sandbox still auto-allows Bash).
+                     If you pass none of these, ez-sandbox asks interactively.
+
   --strict           Refuse to start Claude Code if the sandbox is unavailable
-  -y, --yes          Don't prompt before installing Linux dependencies
+  --uninstall        Remove the config ez-sandbox added (leaves your other
+                     settings untouched)
+  -y, --yes          Skip confirmation prompts (defaults to --prompts=none)
   -h, --help         Show this help
 
 Docs: https://code.claude.com/docs/en/sandboxing
@@ -133,6 +177,35 @@ async function confirm(question: string): Promise<boolean> {
   return false;
 }
 
+// Single-select numbered prompt. Returns the chosen choice's `value`, or the
+// choice marked `default: true` if input is empty / not a TTY.
+async function select<T>(
+  question: string,
+  choices: Array<{ label: string; hint?: string; value: T; default?: boolean }>,
+): Promise<T> {
+  const fallback = choices.find((ch) => ch.default) ?? choices[0]!;
+  if (!process.stdin.isTTY) return fallback.value;
+
+  console.log(`\n${bold(question)}`);
+  choices.forEach((ch, i) => {
+    const tag = ch.default ? dim(" (default)") : "";
+    const hint = ch.hint ? `  ${dim(ch.hint)}` : "";
+    console.log(`  ${cyan(String(i + 1))}) ${ch.label}${tag}${hint}`);
+  });
+  process.stdout.write(`Choose ${dim(`[1-${choices.length}, Enter=default]`)} `);
+
+  for await (const line of console) {
+    const trimmed = line.trim();
+    if (trimmed === "") return fallback.value;
+    const n = Number(trimmed);
+    if (Number.isInteger(n) && n >= 1 && n <= choices.length) {
+      return choices[n - 1]!.value;
+    }
+    process.stdout.write(`${yellow("Enter a number 1-" + choices.length + ":")} `);
+  }
+  return fallback.value;
+}
+
 // ---------------------------------------------------------------------------
 // Platform detection
 // ---------------------------------------------------------------------------
@@ -164,16 +237,153 @@ async function which(bin: string): Promise<boolean> {
 // The sandbox config we write
 // ---------------------------------------------------------------------------
 
-// Paths we never want sandboxed Bash commands to read. ~ is expanded by Claude Code.
+// Paths we never want sandboxed Bash commands (or their child processes) to read.
+// `~/` is expanded by Claude Code; OS-level enforcement covers a Python/Node script
+// reading the file, not just `cat`. Listing a path that doesn't exist is harmless,
+// so we ship both macOS (~/Library/...) and Linux (~/.config, ~/.local/share) variants.
+//
+// Sourced from Anthropic's sandboxing docs (which only name ~/.aws and ~/.ssh),
+// secret-scanner rule sets (gitleaks, trufflehog, detect-secrets), and each tool's
+// official credential-path docs. See README for the "why these and not others" notes.
+//
+// Whole-directory entries are deliberate: filenames vary and neighboring files leak
+// too. Single-FILE entries (e.g. ~/.docker/config.json) are used where the parent
+// dir holds non-secret config the agent legitimately needs.
+//
+// NOTE: mixed secret+config files (~/.npmrc, ~/.gradle/gradle.properties,
+// ~/.m2/settings.xml, ~/.config/pip/pip.conf) are intentionally NOT denied here —
+// blocking them breaks installs/builds. Scrub those via env vars instead.
 const DENY_READ = [
+  // ── SSH / GPG / generic auth ──
   "~/.ssh",
-  "~/.aws",
   "~/.gnupg",
-  "~/.config/gh",
   "~/.netrc",
-  "~/.npmrc",
-  "~/.docker/config.json",
-  "~/.kube/config",
+  "~/.authinfo",
+  "~/.authinfo.gpg",
+  "~/.git-credentials",
+  "~/.config/git/credentials",
+  "~/.envrc", // direnv exports
+  "~/.password-store", // pass(1)
+
+  // ── Cloud providers ──
+  "~/.aws",
+  "~/.config/gcloud", // GCP (Linux + macOS)
+  "~/.azure",
+  "~/.oci", // Oracle Cloud
+  "~/.config/doctl", // DigitalOcean (Linux)
+  "~/Library/Application Support/doctl", // DigitalOcean (macOS)
+  "~/.config/hcloud", // Hetzner
+  "~/.fly", // Fly.io
+  "~/.config/linode-cli",
+  "~/.ibmcloud",
+  "~/.boto", // AWS/GCS boto
+  "~/.s3cfg", // s3cmd
+  "~/.terraform.d/credentials.tfrc.json",
+
+  // ── Kubernetes / containers ──
+  "~/.kube", // kubeconfig dir
+  "~/.docker/config.json", // file only — rest of ~/.docker is fine
+  "~/.config/containers/auth.json",
+  "~/.config/helm", // Linux
+  "~/Library/Preferences/helm", // macOS
+
+  // ── Package / registry tokens (secret-only files) ──
+  "~/.cargo/credentials",
+  "~/.cargo/credentials.toml",
+  "~/.gem/credentials",
+  "~/.local/share/gem/credentials",
+  "~/.pypirc",
+  "~/.composer/auth.json", // macOS
+  "~/.config/composer/auth.json", // Linux
+  "~/.config/pypoetry/auth.toml", // Linux
+  "~/Library/Application Support/pypoetry/auth.toml", // macOS
+
+  // ── Dev-platform CLI tokens ──
+  "~/.config/gh/hosts.yml", // GitHub CLI (plaintext fallback)
+  "~/.config/glab-cli/config.yml", // GitLab CLI
+  "~/.local/share/com.vercel.cli/auth.json", // Vercel (Linux)
+  "~/Library/Application Support/com.vercel.cli/auth.json", // Vercel (macOS)
+  "~/.config/netlify/config.json", // Netlify (Linux)
+  "~/Library/Preferences/netlify/config.json", // Netlify (macOS)
+  "~/.wrangler", // Cloudflare Wrangler (legacy)
+  "~/.config/.wrangler", // Cloudflare Wrangler (Linux XDG)
+  "~/.config/heroku", // (Heroku token also lives in ~/.netrc, denied above)
+  "~/.databrickscfg",
+  "~/.snowflake",
+  "~/.config/stripe/config.toml", // Stripe CLI (both OSes)
+  "~/.sentryclirc",
+  "~/.supabase/access-token",
+  "~/.railway/config.json", // Railway (both OSes)
+  "~/.terraformrc",
+
+  // ── Databases ──
+  "~/.pgpass",
+  "~/.pg_service.conf",
+  "~/.mylogin.cnf", // MySQL obfuscated login
+  "~/.mongorc.js",
+
+  // ── Password managers / secret CLIs ──
+  "~/.config/op", // 1Password CLI
+  "~/.op",
+  "~/Library/Group Containers/2BUA8C4S2C.com.1password", // 1Password (macOS)
+  "~/.config/gopass",
+  "~/.local/share/gopass",
+  "~/.config/Bitwarden CLI", // Bitwarden CLI (Linux)
+  "~/Library/Application Support/Bitwarden CLI", // Bitwarden CLI (macOS)
+  "~/.vault-token", // HashiCorp Vault
+
+  // ── OS / browser keychains & login stores ──
+  "~/Library/Keychains", // macOS Keychain
+  "~/.local/share/keyrings", // GNOME keyring (Linux)
+  "~/.local/share/kwalletd", // KWallet (Linux)
+  "~/.mozilla/firefox", // Firefox logins.json + key4.db (Linux)
+  "~/Library/Application Support/Firefox/Profiles", // Firefox (macOS)
+  "~/.config/google-chrome", // Chrome (Linux)
+  "~/.config/chromium",
+  "~/Library/Application Support/Google/Chrome", // Chrome (macOS)
+
+  // ── Crypto wallets ──
+  "~/.ethereum/keystore", // geth (Linux)
+  "~/Library/Ethereum/keystore", // geth (macOS)
+  "~/.bitcoin", // Bitcoin Core (Linux)
+  "~/Library/Application Support/Bitcoin", // Bitcoin Core (macOS)
+  "~/.config/solana/id.json", // Solana keypair (both OSes)
+  "~/.electrum",
+
+  // ── Shell / REPL history (leak inline-typed secrets) ──
+  "~/.bash_history",
+  "~/.zsh_history",
+  "~/.sh_history",
+  "~/.history",
+  "~/.python_history",
+  "~/.node_repl_history",
+  "~/.psql_history",
+  "~/.mysql_history",
+  "~/.rediscli_history",
+  "~/.sqlite_history",
+  "~/.local/share/fish/fish_history",
+
+  // ── AI coding agents' own credentials ──
+  "~/.claude/.credentials.json", // Claude Code (Linux/Windows; macOS uses Keychain)
+  "~/.codex/auth.json", // OpenAI Codex CLI (note: ~/.codex, not ~/.config/codex)
+  "~/.config/github-copilot",
+  "~/.gemini/oauth_creds.json",
+  "~/.cursor/cli-config.json",
+  "~/.aider.conf.yml",
+];
+
+// Filesystem-wide secret patterns the sandbox's path-based denyRead can't express
+// (it has no glob support). These go into permissions.deny as Read(...) rules, which
+// DO support gitignore-style globs — defense-in-depth for the built-in file tools.
+const DENY_READ_GLOBS = [
+  "Read(//**/.env)", // any .env anywhere
+  "Read(//**/.env.*)",
+  "Read(~/**/*.pem)",
+  "Read(~/**/*.key)",
+  "Read(~/**/*.p12)",
+  "Read(~/**/*.pfx)",
+  "Read(~/**/*.ppk)",
+  "Read(~/**/*.kdbx)", // KeePass databases
 ];
 
 // When the user opts into --network=lockdown, allow only these. Anything else
@@ -205,6 +415,72 @@ function buildSandboxConfig(opts: Options): Record<string, unknown> {
     },
     network,
   };
+}
+
+// permissions.defaultMode values we set for each prompt level. "none" leaves the
+// key untouched. These are the only two values we'll remove on uninstall, so we
+// never clobber a defaultMode the user chose themselves.
+const PROMPTS_TO_MODE: Record<Exclude<PromptsMode, "none">, string> = {
+  acceptEdits: "acceptEdits",
+  auto: "auto",
+};
+
+// Merge our config into the settings object in place: replace the `sandbox` block,
+// add our glob Read() deny rules to permissions.deny, and (unless prompts==none)
+// set permissions.defaultMode — without dropping the user's own rules or dupes.
+function applyConfig(settings: Record<string, unknown>, opts: Options): void {
+  settings.sandbox = buildSandboxConfig(opts);
+
+  const permissions = (settings.permissions ??= {}) as Record<string, unknown>;
+  const deny = (permissions.deny ??= []) as unknown[];
+  for (const rule of DENY_READ_GLOBS) {
+    if (!deny.includes(rule)) deny.push(rule);
+  }
+
+  const mode = opts.prompts ?? "none";
+  if (mode !== "none") {
+    permissions.defaultMode = PROMPTS_TO_MODE[mode];
+  }
+}
+
+// Reverse of applyConfig: remove the `sandbox` block, our glob deny rules, and a
+// defaultMode we set — pruning now-empty containers. Returns true if anything was
+// actually removed.
+function removeConfig(settings: Record<string, unknown>): boolean {
+  let changed = false;
+
+  if ("sandbox" in settings) {
+    delete settings.sandbox;
+    changed = true;
+  }
+
+  const permissions = settings.permissions as Record<string, unknown> | undefined;
+  if (permissions) {
+    const deny = permissions.deny as unknown[] | undefined;
+    if (Array.isArray(deny)) {
+      const filtered = deny.filter((r) => !DENY_READ_GLOBS.includes(r as string));
+      if (filtered.length !== deny.length) {
+        changed = true;
+        if (filtered.length === 0) delete permissions.deny;
+        else permissions.deny = filtered;
+      }
+    }
+
+    // Only remove defaultMode if it's one of the values WE set, so we don't wipe
+    // a mode the user configured independently.
+    const ourModes = Object.values(PROMPTS_TO_MODE);
+    if (ourModes.includes(permissions.defaultMode as string)) {
+      delete permissions.defaultMode;
+      changed = true;
+    }
+
+    // Drop permissions entirely if it's now an empty object we can safely remove.
+    if (Object.keys(permissions).length === 0) {
+      delete settings.permissions;
+    }
+  }
+
+  return changed;
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +631,57 @@ async function printStatus(os: OS): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Uninstall
+// ---------------------------------------------------------------------------
+
+async function runUninstall(opts: Options): Promise<void> {
+  console.log(bold("Removing the ez-sandbox config\n"));
+
+  const file = Bun.file(SETTINGS_PATH);
+  if (!(await file.exists())) {
+    ok(`Nothing to do — ${dim(SETTINGS_PATH)} doesn't exist`);
+    return;
+  }
+
+  const settings = await readSettings();
+  // Work on a copy so we can show a diff / honor dry-run before committing.
+  const next = structuredClone(settings);
+  const changed = removeConfig(next);
+
+  if (!changed) {
+    ok("No ez-sandbox config found in settings.json — nothing to remove");
+    return;
+  }
+
+  if (opts.dryRun) {
+    info("(dry-run) would remove the `sandbox` block and our Read() deny rules.");
+    info("Resulting settings.json:");
+    console.log(JSON.stringify(next, null, 2));
+    return;
+  }
+
+  if (!opts.yes) {
+    warn("This removes the `sandbox` block and ez-sandbox's Read() deny rules.");
+    warn("Your other Claude Code settings are left untouched.");
+    const proceed = await confirm("Proceed?");
+    if (!proceed) {
+      info("Aborted — nothing changed.");
+      return;
+    }
+  }
+
+  await writeSettings(next);
+  ok(`Removed ez-sandbox config from ${dim(SETTINGS_PATH)}`);
+
+  const backup = `${SETTINGS_PATH}.ez-sandbox.bak`;
+  if (await Bun.file(backup).exists()) {
+    info(`Your pre-install settings backup is still at ${dim(backup)}`);
+  }
+  console.log();
+  console.log(dim("On Linux, bubblewrap and socat were left installed (harmless)."));
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -369,12 +696,19 @@ async function main() {
   const os = await detectOS();
 
   if (opts.print) {
-    console.log(JSON.stringify({ sandbox: buildSandboxConfig(opts) }, null, 2));
+    const preview: Record<string, unknown> = {};
+    applyConfig(preview, opts);
+    console.log(JSON.stringify(preview, null, 2));
     return;
   }
 
   if (opts.check) {
     await printStatus(os);
+    return;
+  }
+
+  if (opts.uninstall) {
+    await runUninstall(opts);
     return;
   }
 
@@ -410,17 +744,21 @@ async function main() {
     }
   }
 
-  // 2. Merge sandbox config into settings.json.
+  // 2. Decide how aggressively to reduce permission prompts. If the user didn't
+  //    pass --auto/--accept-edits/--prompts, ask interactively (non-interactive
+  //    runs fall back to "none" — the safe, prompt-preserving default).
+  opts.prompts = await resolvePrompts(opts);
+
+  // 3. Merge sandbox config into settings.json.
   const settings = await readSettings();
-  const newSandbox = buildSandboxConfig(opts);
-  const before = JSON.stringify(settings.sandbox ?? null);
-  const after = JSON.stringify(newSandbox);
-  settings.sandbox = newSandbox;
+  const before = JSON.stringify(settings);
+  applyConfig(settings, opts);
+  const after = JSON.stringify(settings);
 
   if (opts.dryRun) {
     console.log();
     info("(dry-run) would write this to " + dim(SETTINGS_PATH) + ":");
-    console.log(JSON.stringify({ sandbox: newSandbox }, null, 2));
+    console.log(after === before ? "(no changes)" : JSON.stringify(settings, null, 2));
     return;
   }
 
@@ -431,10 +769,10 @@ async function main() {
     ok(`Wrote sandbox config to ${dim(SETTINGS_PATH)}`);
   }
 
-  // 3. Friendly summary.
+  // 4. Friendly summary.
   console.log();
   console.log(bold("Done. Your Claude Code Bash tool is now sandboxed."));
-  console.log(`  ${green("•")} Sandboxed Bash can't read: ${dim(DENY_READ.join(", "))}`);
+  console.log(`  ${green("•")} Sandboxed Bash can't read your secrets ${dim(`(${DENY_READ.length} paths)`)}`);
   if (opts.network === "lockdown") {
     console.log(`  ${green("•")} Network locked to: ${dim(LOCKDOWN_DOMAINS.join(", "))}`);
   } else {
@@ -442,14 +780,66 @@ async function main() {
       `  ${green("•")} Network: Claude Code prompts on each new domain ${dim("(--network=lockdown for a strict allowlist)")}`,
     );
   }
+  if (opts.prompts === "auto") {
+    console.log(
+      `  ${green("•")} Permission mode: ${bold("auto")} — Claude runs with background safety checks, far fewer prompts`,
+    );
+    console.log(
+      dim("    (needs Claude Code ≥ v2.1.83 and Opus 4.6+/Sonnet 4.6; otherwise it falls back to prompting)"),
+    );
+  } else if (opts.prompts === "acceptEdits") {
+    console.log(
+      `  ${green("•")} Permission mode: ${bold("acceptEdits")} — file edits in your project auto-accept; sandboxed Bash auto-runs`,
+    );
+  } else {
+    console.log(
+      `  ${green("•")} Permission mode: unchanged — sandboxed Bash auto-runs, but file edits still prompt`,
+    );
+    console.log(dim("    (re-run with --auto or --accept-edits for fewer prompts)"));
+  }
   console.log(
     dim(
-      "\nNote: this sandboxes Bash commands only — file edits, MCP servers, and hooks\n" +
-        "still run on the host. For fully unattended / --dangerously-skip-permissions\n" +
-        "runs, use a devcontainer or `npx @anthropic-ai/sandbox-runtime claude`.",
+      "\nNote: the sandbox covers Bash commands only — file edits, MCP servers, and\n" +
+        "hooks run on the host. 'auto'/'acceptEdits' control whether those file edits\n" +
+        "prompt; the sandbox controls what a Bash command can touch.",
     ),
   );
-  console.log(dim("Verify any time with: ") + cyan("ez-sandbox --check"));
+  console.log(
+    dim("Verify any time with: ") +
+      cyan("ez-sandbox --check") +
+      dim("  ·  undo with ") +
+      cyan("ez-sandbox --uninstall"),
+  );
+}
+
+// Resolve the prompt-reduction level. Explicit flag wins; otherwise ask (TTY) or
+// default to "none" (non-interactive / -y).
+async function resolvePrompts(opts: Options): Promise<PromptsMode> {
+  if (opts.prompts !== undefined) return opts.prompts;
+  if (opts.yes || !process.stdin.isTTY) return "none";
+
+  return select<PromptsMode>(
+    "Reduce permission prompts? The sandbox already lets Bash run without prompts —\n" +
+      "this controls whether Claude's file edits also stop asking.",
+    [
+      {
+        label: "Auto mode",
+        hint: "fewest prompts; classifier-checked. Safe replacement for --dangerously-skip-permissions. Needs recent Claude Code + Opus/Sonnet 4.6.",
+        value: "auto",
+      },
+      {
+        label: "Accept edits",
+        hint: "auto-accept file edits in your project. Works everywhere; near prompt-free with the sandbox.",
+        value: "acceptEdits",
+        default: true,
+      },
+      {
+        label: "Keep prompting for edits",
+        hint: "only Bash auto-runs (sandboxed); file edits still ask. Most cautious.",
+        value: "none",
+      },
+    ],
+  );
 }
 
 main().catch((e) => fail((e as Error).stack ?? String(e)));
